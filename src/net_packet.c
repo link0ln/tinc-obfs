@@ -328,14 +328,31 @@ static bool receive_udppacket(node_t *n, vpn_packet_t *inpkt) {
 		}
 
 		n->status.udppacket = true;
-		const uint8_t *payload = DATA(inpkt);
+		uint8_t *payload = DATA(inpkt);
 		size_t payload_len = inpkt->len;
+		obfs_prefix_info_t prefix_info = {0};
 
 		if(obfs_is_enabled()) {
-			if(!obfs_strip_prefix(&payload, &payload_len)) {
+			if(!obfs_strip_prefix(&payload, &payload_len, &prefix_info)) {
 				n->status.udppacket = false;
 				logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: dropping malformed datagram from %s (%s)", n->name, n->hostname);
 				return false;
+			}
+
+			if(prefix_info.is_junk) {
+				n->status.udppacket = false;
+				logger(DEBUG_TRAFFIC, LOG_DEBUG, "Obfs: received junk datagram from %s (%s)", n->name, n->hostname);
+				return true;
+			}
+
+			if(prefix_info.has_original_type) {
+				if(payload_len < 5) {
+					n->status.udppacket = false;
+					logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: restored packet too short to rewrite type for %s (%s)", n->name, n->hostname);
+					return false;
+				}
+
+				payload[4] = prefix_info.original_type;
 			}
 		}
 
@@ -880,12 +897,31 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 	bool relay_supported = (relay->options >> 24) >= 4;
 	bool tcponly = (myself->options | relay->options) & OPTION_TCPONLY;
 	obfs_blob_t header_junk = {0};
-	obfs_blob_t handshake_tags = {0};
-	size_t prefix_len = 0;
+	obfs_blob_t *handshake_packets = NULL;
+	size_t handshake_count = 0;
+	size_t handshake_total_len = 0;
 	bool use_obfs = obfs_is_enabled();
+	uint8_t prefix_flags = 0;
+	bool store_original_type = false;
+	uint8_t original_type = 0;
+	uint8_t wire_type = 0;
+	size_t metadata_len = 0;
+	size_t prefix_payload_len = 0;
+	size_t prefix_total_len = 0;
+	obfs_message_kind_t kind = obfs_classify_sptps_type(type);
+
+#define FREE_HANDSHAKE_PACKETS() \
+	do { \
+		if(handshake_packets) { \
+			for(size_t _idx = 0; _idx < handshake_count; ++_idx) { \
+				obfs_free_blob(&handshake_packets[_idx]); \
+			} \
+			free(handshake_packets); \
+			handshake_packets = NULL; \
+		} \
+	} while(0)
 
 	if(use_obfs) {
-		obfs_message_kind_t kind = obfs_classify_sptps_type(type);
 		size_t configured = obfs_header_junk_size(kind);
 
 		if(configured > UINT16_MAX) {
@@ -896,17 +932,52 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 		header_junk = obfs_create_header_junk(kind);
 
 		if(type == SPTPS_HANDSHAKE) {
-			handshake_tags = obfs_build_handshake_tags();
+			handshake_count = obfs_handshake_packet_count();
+
+			if(handshake_count) {
+				handshake_packets = calloc(handshake_count, sizeof(*handshake_packets));
+				if(!handshake_packets) {
+					logger(DEBUG_ALWAYS, LOG_ERR, "Obfs: failed to allocate handshake packet cache");
+					obfs_free_blob(&header_junk);
+					return false;
+				}
+
+				for(size_t i = 0; i < handshake_count; ++i) {
+					if(obfs_build_handshake_packet(i, &handshake_packets[i])) {
+						handshake_total_len += handshake_packets[i].len;
+					}
+				}
+			}
 		}
 
-		if(header_junk.len > UINT16_MAX - handshake_tags.len) {
+		prefix_payload_len = header_junk.len + handshake_total_len;
+
+		if(len >= 5) {
+			uint8_t default_type = ((const uint8_t *)data)[4];
+			wire_type = default_type;
+
+			if(obfs_choose_datagram_type(kind, default_type, &wire_type)) {
+				store_original_type = true;
+				original_type = default_type;
+				prefix_flags |= OBFS_PREFIX_FLAG_HAS_TYPE;
+			}
+		} else {
+			logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: unexpected short record (len=%zu) for type override", len);
+		}
+
+		metadata_len = 1 + (store_original_type ? 1 : 0);
+		prefix_payload_len += metadata_len;
+
+		if(prefix_payload_len > UINT16_MAX) {
 			logger(DEBUG_ALWAYS, LOG_ERR, "Obfs prefix length exceeds 16-bit limit");
+			FREE_HANDSHAKE_PACKETS();
 			obfs_free_blob(&header_junk);
-			obfs_free_blob(&handshake_tags);
 			return false;
 		}
 
-		prefix_len = sizeof(uint16_t) + header_junk.len + handshake_tags.len;
+		prefix_total_len = sizeof(uint16_t) + prefix_payload_len;
+	} else {
+		prefix_total_len = 0;
 	}
 
 	/* Send it via TCP if it is a handshake packet, TCPOnly is in use, this is a relay packet that the other node cannot understand, or this packet is larger than the MTU. */
@@ -914,7 +985,7 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 	bool force_udp_handshake = false;
 
 	if(use_obfs && type == SPTPS_HANDSHAKE) {
-		force_udp_handshake = header_junk.len > 0 || handshake_tags.len > 0;
+		force_udp_handshake = prefix_payload_len > 0;
 	}
 
 	if((type == SPTPS_HANDSHAKE && !force_udp_handshake) || tcponly || (!direct && !relay_supported) || (type != PKT_PROBE && (len - SPTPS_DATAGRAM_OVERHEAD) > relay->minmtu)) {
@@ -928,8 +999,8 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 			memcpy(buf_ptr, data, len);
 			logger(DEBUG_TRAFFIC, LOG_INFO, "Sending packet from %s (%s) to %s (%s) via %s (%s) (TCP)", from->name, from->hostname, to->name, to->hostname, to->nexthop->name, to->nexthop->hostname);
 			bool tcp_success = send_sptps_tcppacket(to->nexthop->connection, buf, sizeof(buf));
+			FREE_HANDSHAKE_PACKETS();
 			obfs_free_blob(&header_junk);
-			obfs_free_blob(&handshake_tags);
 			return tcp_success;
 		}
 
@@ -939,17 +1010,118 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 		/* If this is a handshake packet, use ANS_KEY instead of REQ_KEY, for two reasons:
 		    - We don't want intermediate nodes to switch to UDP to relay these packets;
 		    - ANS_KEY allows us to learn the reflexive UDP address. */
-		bool request_success;
-		if(type == SPTPS_HANDSHAKE) {
-			to->incompression = myself->incompression;
-			request_success = send_request(to->nexthop->connection, "%d %s %s %s -1 -1 -1 %d", ANS_KEY, from->name, to->name, buf, to->incompression);
-		} else {
-			request_success = send_request(to->nexthop->connection, "%d %s %s %d %s", REQ_KEY, from->name, to->name, SPTPS_PACKET, buf);
-		}
+	bool request_success;
+	if(type == SPTPS_HANDSHAKE) {
+		to->incompression = myself->incompression;
+		request_success = send_request(to->nexthop->connection, "%d %s %s %s -1 -1 -1 %d", ANS_KEY, from->name, to->name, buf, to->incompression);
+	} else {
+		request_success = send_request(to->nexthop->connection, "%d %s %s %d %s", REQ_KEY, from->name, to->name, SPTPS_PACKET, buf);
+	}
 
+	FREE_HANDSHAKE_PACKETS();
+	obfs_free_blob(&header_junk);
+	return request_success;
+}
+
+	const sockaddr_t *sa = NULL;
+	int sock = 0;
+
+	if(relay->status.send_locally) {
+		choose_local_address(relay, &sa, &sock);
+	}
+
+	if(!sa) {
+		choose_udp_address(relay, &sa, &sock);
+	}
+
+	if(!sa) {
+		logger(DEBUG_TRAFFIC, LOG_WARNING, "Unable to determine UDP address for %s (%s)", relay->name, relay->hostname);
+		FREE_HANDSHAKE_PACKETS();
 		obfs_free_blob(&header_junk);
-		obfs_free_blob(&handshake_tags);
-		return request_success;
+		return false;
+	}
+
+	if(use_obfs && type == SPTPS_HANDSHAKE) {
+		for(size_t i = 0; i < handshake_count; ++i) {
+			obfs_blob_t *hpkt = &handshake_packets[i];
+			size_t payload_len = 1 + hpkt->len;
+
+			if(payload_len > UINT16_MAX) {
+				logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: handshake junk packet too large (%zu)", payload_len);
+				continue;
+			}
+
+			size_t packet_len = sizeof(uint16_t) + payload_len;
+			uint8_t *packet = malloc(packet_len);
+
+			if(!packet) {
+				logger(DEBUG_ALWAYS, LOG_ERR, "Obfs: failed to allocate handshake junk packet");
+				break;
+			}
+
+			uint16_t net_len = htons((uint16_t)payload_len);
+			memcpy(packet, &net_len, sizeof(net_len));
+			packet[sizeof(net_len)] = OBFS_PREFIX_FLAG_JUNK;
+
+			if(hpkt->len) {
+				memcpy(packet + sizeof(net_len) + 1, hpkt->data, hpkt->len);
+			}
+
+			if(sendto(listen_socket[sock].udp.fd, packet, packet_len, 0, &sa->sa, SALEN(sa->sa)) < 0 && !sockwouldblock(sockerrno)) {
+				if(!sockmsgsize(sockerrno)) {
+					logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: failed to send handshake junk datagram to %s (%s): %s", relay->name, relay->hostname, sockstrerror(sockerrno));
+				}
+			}
+
+			free(packet);
+		}
+	}
+
+	if(use_obfs && obfs_config.junk_packet_count > 0) {
+		int count = obfs_config.junk_packet_count;
+		int min_size = obfs_config.junk_packet_min_size;
+		int max_size = obfs_config.junk_packet_max_size;
+
+		for(int i = 0; i < count; ++i) {
+			int target_size = obfs_random_in_range(min_size, max_size);
+
+			if(target_size <= 0) {
+				continue;
+			}
+
+			if(target_size > (int)(UINT16_MAX - 1)) {
+				target_size = (int)(UINT16_MAX - 1);
+			}
+
+			obfs_blob_t junk_payload = obfs_create_junk_packet((size_t)target_size);
+			size_t payload_len = 1 + junk_payload.len;
+			uint16_t net_payload_len = htons((uint16_t)payload_len);
+			size_t packet_len = sizeof(net_payload_len) + payload_len;
+			uint8_t *packet = malloc(packet_len);
+
+			if(!packet) {
+				obfs_free_blob(&junk_payload);
+				logger(DEBUG_ALWAYS, LOG_ERR, "Obfs: failed to allocate junk packet");
+				break;
+			}
+
+			memcpy(packet, &net_payload_len, sizeof(net_payload_len));
+			packet[sizeof(net_payload_len)] = OBFS_PREFIX_FLAG_JUNK;
+
+			if(junk_payload.len) {
+				memcpy(packet + sizeof(net_payload_len) + 1, junk_payload.data, junk_payload.len);
+			}
+
+			obfs_free_blob(&junk_payload);
+
+			if(sendto(listen_socket[sock].udp.fd, packet, packet_len, 0, &sa->sa, SALEN(sa->sa)) < 0 && !sockwouldblock(sockerrno)) {
+				if(!sockmsgsize(sockerrno)) {
+					logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: failed to send junk datagram to %s (%s): %s", relay->name, relay->hostname, sockstrerror(sockerrno));
+				}
+			}
+
+			free(packet);
+		}
 	}
 
 	size_t overhead = 0;
@@ -958,7 +1130,7 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 		overhead += sizeof(to->id) + sizeof(from->id);
 	}
 
-	char buf[len + overhead + prefix_len];
+	char buf[len + overhead + prefix_total_len];
 	char *buf_ptr = buf;
 
 	if(relay_supported) {
@@ -978,35 +1150,40 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 	}
 
 	if(use_obfs) {
-		uint16_t junk_total = htons((uint16_t)(header_junk.len + handshake_tags.len));
+		uint16_t junk_total = htons((uint16_t)prefix_payload_len);
 		memcpy(buf_ptr, &junk_total, sizeof(junk_total));
 		buf_ptr += sizeof(junk_total);
+
+		*buf_ptr++ = prefix_flags;
+
+		if(store_original_type) {
+			*buf_ptr++ = original_type;
+		}
 
 		if(header_junk.len) {
 			memcpy(buf_ptr, header_junk.data, header_junk.len);
 			buf_ptr += header_junk.len;
 		}
 
-		if(handshake_tags.len) {
-			memcpy(buf_ptr, handshake_tags.data, handshake_tags.len);
-			buf_ptr += handshake_tags.len;
+		if(handshake_total_len) {
+			for(size_t i = 0; i < handshake_count; ++i) {
+				if(handshake_packets[i].len) {
+					memcpy(buf_ptr, handshake_packets[i].data, handshake_packets[i].len);
+					buf_ptr += handshake_packets[i].len;
+				}
+			}
 		}
 	}
 
 	/* TODO: if this copy turns out to be a performance concern, change sptps_send_record() to add some "pre-padding" to the buffer and use that instead */
-	memcpy(buf_ptr, data, len);
+	uint8_t *record_ptr = (uint8_t *)buf_ptr;
+	memcpy(record_ptr, data, len);
+
+	if(use_obfs && store_original_type && len >= 5) {
+		record_ptr[4] = wire_type;
+	}
+
 	buf_ptr += len;
-
-	const sockaddr_t *sa = NULL;
-	int sock;
-
-	if(relay->status.send_locally) {
-		choose_local_address(relay, &sa, &sock);
-	}
-
-	if(!sa) {
-		choose_udp_address(relay, &sa, &sock);
-	}
 
 	logger(DEBUG_TRAFFIC, LOG_INFO, "Sending packet from %s (%s) to %s (%s) via %s (%s) (UDP)", from->name, from->hostname, to->name, to->hostname, relay->name, relay->hostname);
 
@@ -1028,13 +1205,16 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 			try_fix_mtu(relay);
 		} else {
 			logger(DEBUG_TRAFFIC, LOG_WARNING, "Error sending UDP SPTPS packet to %s (%s): %s", relay->name, relay->hostname, sockstrerror(sockerrno));
+			FREE_HANDSHAKE_PACKETS();
 			obfs_free_blob(&header_junk);
-			obfs_free_blob(&handshake_tags);
 			return false;
 		}
 	}
+
+	FREE_HANDSHAKE_PACKETS();
 	obfs_free_blob(&header_junk);
-	obfs_free_blob(&handshake_tags);
+
+#undef FREE_HANDSHAKE_PACKETS
 	return true;
 }
 

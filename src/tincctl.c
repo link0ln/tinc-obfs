@@ -29,6 +29,7 @@
 #include "xalloc.h"
 #include "protocol.h"
 #include "control_common.h"
+#include "obfs.h"
 #include "crypto.h"
 #include "ecdsagen.h"
 #include "fsck.h"
@@ -149,6 +150,7 @@ static void usage(bool status) {
 #endif
 		       "  pcap [snaplen]             Dump traffic in pcap format [up to snaplen bytes per packet]\n"
 		       "  log [level]                Dump log output [up to the specified level]\n"
+		       "  obfs <cmd> [...]           Inspect or adjust traffic obfuscation runtime settings\n"
 		       "  export                     Export host configuration of local node to standard output\n"
 		       "  export-all                 Export all host configuration files to standard output\n"
 		       "  import                     Import host configuration file(s) from standard input\n"
@@ -1617,6 +1619,539 @@ static int cmd_log(int argc, char *argv[]) {
 	return 0;
 }
 
+static int obfs_kind_index(const char *name) {
+	static const char *const names[] = { "init", "response", "cookie", "transport" };
+
+	if(!name) {
+		return -1;
+	}
+
+	for(size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+		if(!strcasecmp(name, names[i])) {
+			return (int)i;
+		}
+	}
+
+	return -1;
+}
+
+static const char *obfs_map_cli_key(const char *key) {
+	static const struct {
+		const char *cli;
+		const char *wire;
+	} mapping[] = {
+		{ "junk-count", "junk_count" },
+		{ "junk-min", "junk_min" },
+		{ "junk-max", "junk_max" },
+		{ "header-junk-init", "header_junk_init" },
+		{ "header-junk-response", "header_junk_response" },
+		{ "header-junk-cookie", "header_junk_cookie" },
+		{ "header-junk-transport", "header_junk_transport" },
+		{ "magic-init", "magic_init" },
+		{ "magic-response", "magic_response" },
+		{ "magic-cookie", "magic_cookie" },
+		{ "magic-transport", "magic_transport" },
+	};
+
+	for(size_t i = 0; i < sizeof(mapping) / sizeof(mapping[0]); ++i) {
+		if(!strcasecmp(key, mapping[i].cli)) {
+			return mapping[i].wire;
+		}
+	}
+
+	return NULL;
+}
+
+static bool obfs_check_whitespace(const char *value) {
+	if(!value) {
+		return false;
+	}
+
+	return strcspn(value, " \t\r\n") == strlen(value);
+}
+
+static int cmd_obfs(int argc, char *argv[]) {
+	if(argc < 2) {
+		fprintf(stderr, "Usage: obfs <status|enable|disable|set> [...].\n");
+		return 1;
+	}
+
+	const char *sub = argv[1];
+
+	if(!strcasecmp(sub, "status")) {
+		if(argc != 2) {
+			fprintf(stderr, "Usage: obfs status\n");
+			return 1;
+		}
+
+		if(!connect_tincd(true)) {
+			return 1;
+		}
+
+		sendline(fd, "%d %d", CONTROL, REQ_OBFS_STATUS);
+
+		int rc = 0;
+
+		struct {
+			bool has_enabled;
+			bool enabled;
+			bool has_junk_count;
+			int junk_count;
+			bool has_junk_min;
+			int junk_min;
+			bool has_junk_max;
+			int junk_max;
+			bool header_junk_seen[OBFS_MESSAGE_KIND_COUNT];
+			int header_junk[OBFS_MESSAGE_KIND_COUNT];
+			bool magic_seen[OBFS_MESSAGE_KIND_COUNT];
+			bool magic_enabled[OBFS_MESSAGE_KIND_COUNT];
+			uint32_t magic_min[OBFS_MESSAGE_KIND_COUNT];
+			uint32_t magic_max[OBFS_MESSAGE_KIND_COUNT];
+			bool handshake_tags_seen;
+			size_t handshake_tag_count;
+			char **tag_names;
+			char **tag_patterns;
+			size_t tag_count;
+			size_t tag_capacity;
+		} info = {0};
+
+		for(size_t i = 0; i < OBFS_MESSAGE_KIND_COUNT; ++i) {
+			info.header_junk[i] = 0;
+			info.magic_min[i] = 0;
+			info.magic_max[i] = 0;
+		}
+
+		bool got_ack = false;
+		char copy[sizeof(line)];
+
+		while(recvline(fd, line, sizeof(line))) {
+			strncpy(copy, line, sizeof(copy));
+			copy[sizeof(copy) - 1] = '\0';
+
+			char *saveptr = NULL;
+			char *tok = strtok_r(copy, " \t\r\n", &saveptr);
+
+			if(!tok) {
+				continue;
+			}
+
+			int code = atoi(tok);
+			tok = strtok_r(NULL, " \t\r\n", &saveptr);
+
+			if(!tok) {
+				continue;
+			}
+
+			int req = atoi(tok);
+
+			if(code != CONTROL || req != REQ_OBFS_STATUS) {
+				continue;
+			}
+
+			char *key = strtok_r(NULL, " \t\r\n", &saveptr);
+
+			if(!key) {
+				got_ack = true;
+				break;
+			}
+
+			if(!strcasecmp(key, "enabled")) {
+				char *value = strtok_r(NULL, " \t\r\n", &saveptr);
+
+				if(value) {
+					info.has_enabled = true;
+					info.enabled = atoi(value) != 0;
+				}
+
+				continue;
+			}
+
+			if(!strcasecmp(key, "junk_count")) {
+				char *value = strtok_r(NULL, " \t\r\n", &saveptr);
+
+				if(value) {
+					info.has_junk_count = true;
+					info.junk_count = atoi(value);
+				}
+
+				continue;
+			}
+
+			if(!strcasecmp(key, "junk_min")) {
+				char *value = strtok_r(NULL, " \t\r\n", &saveptr);
+
+				if(value) {
+					info.has_junk_min = true;
+					info.junk_min = atoi(value);
+				}
+
+				continue;
+			}
+
+			if(!strcasecmp(key, "junk_max")) {
+				char *value = strtok_r(NULL, " \t\r\n", &saveptr);
+
+				if(value) {
+					info.has_junk_max = true;
+					info.junk_max = atoi(value);
+				}
+
+				continue;
+			}
+
+			if(!strcasecmp(key, "header_junk")) {
+				char *kind = strtok_r(NULL, " \t\r\n", &saveptr);
+				char *value = strtok_r(NULL, " \t\r\n", &saveptr);
+
+				int idx = obfs_kind_index(kind);
+
+				if(idx >= 0 && value) {
+					info.header_junk_seen[idx] = true;
+					info.header_junk[idx] = atoi(value);
+				}
+
+				continue;
+			}
+
+			if(!strcasecmp(key, "tag")) {
+				char *tag_name = strtok_r(NULL, " 	\r\n", &saveptr);
+				char *encoded = strtok_r(NULL, " 	\r\n", &saveptr);
+
+				if(tag_name && encoded) {
+					size_t encoded_len = strlen(encoded);
+					size_t buf_len = encoded_len / 4 * 3 + 4;
+					char *pattern = xmalloc(buf_len + 1);
+					size_t produced = b64decode(encoded, pattern, encoded_len);
+
+					if(encoded_len && !produced) {
+						fprintf(stderr, "Invalid handshake tag payload from daemon.\n");
+						free(pattern);
+						rc = 1;
+						goto status_cleanup;
+					}
+
+					pattern[produced] = '\0';
+
+					if(info.tag_count == info.tag_capacity) {
+						size_t new_capacity = info.tag_capacity ? info.tag_capacity * 2 : 4;
+						info.tag_names = xrealloc(info.tag_names, new_capacity * sizeof(char *));
+						info.tag_patterns = xrealloc(info.tag_patterns, new_capacity * sizeof(char *));
+						info.tag_capacity = new_capacity;
+					}
+
+					info.tag_names[info.tag_count] = strcmp(tag_name, "-") ? xstrdup(tag_name) : NULL;
+					info.tag_patterns[info.tag_count] = pattern;
+					info.tag_count++;
+				}
+
+				continue;
+			}
+
+			if(!strcasecmp(key, "magic")) {
+				char *kind = strtok_r(NULL, " \t\r\n", &saveptr);
+				char *enabled = strtok_r(NULL, " \t\r\n", &saveptr);
+				char *minv = strtok_r(NULL, " \t\r\n", &saveptr);
+				char *maxv = strtok_r(NULL, " \t\r\n", &saveptr);
+
+				int idx = obfs_kind_index(kind);
+
+				if(idx >= 0 && enabled && minv && maxv) {
+					info.magic_seen[idx] = true;
+					info.magic_enabled[idx] = atoi(enabled) != 0;
+					info.magic_min[idx] = (uint32_t)strtoul(minv, NULL, 10);
+					info.magic_max[idx] = (uint32_t)strtoul(maxv, NULL, 10);
+				}
+
+				continue;
+			}
+
+			if(!strcasecmp(key, "handshake_tags")) {
+				char *value = strtok_r(NULL, " \t\r\n", &saveptr);
+
+				if(value) {
+					info.handshake_tags_seen = true;
+					info.handshake_tag_count = (size_t)strtoull(value, NULL, 10);
+				}
+
+				continue;
+			}
+		}
+
+		if(!got_ack) {
+			fprintf(stderr, "Failed to read obfuscation status from tincd.\n");
+			rc = 1;
+			goto status_cleanup;
+		}
+
+		static const char *const names[] = { "init", "response", "cookie", "transport" };
+
+		printf("Obfuscation enabled: %s\n", info.has_enabled && info.enabled ? "yes" : "no");
+
+		int junk_count = info.has_junk_count ? info.junk_count : 0;
+		int junk_min = info.has_junk_min ? info.junk_min : 0;
+		int junk_max = info.has_junk_max ? info.junk_max : 0;
+		printf("Junk packets: count=%d size=%d-%d\n", junk_count, junk_min, junk_max);
+
+		printf("Header junk (bytes):");
+		for(size_t i = 0; i < OBFS_MESSAGE_KIND_COUNT; ++i) {
+			int value = info.header_junk_seen[i] ? info.header_junk[i] : 0;
+			printf(" %s=%d", names[i], value);
+		}
+		printf("\n");
+
+		printf("Magic ranges:");
+		for(size_t i = 0; i < OBFS_MESSAGE_KIND_COUNT; ++i) {
+			if(info.magic_seen[i] && info.magic_enabled[i]) {
+				printf(" %s=%lu-%lu", names[i], (unsigned long)info.magic_min[i], (unsigned long)info.magic_max[i]);
+			} else {
+				printf(" %s=off", names[i]);
+			}
+		}
+		printf("\n");
+
+		size_t tag_count = info.tag_count ? info.tag_count : (info.handshake_tags_seen ? info.handshake_tag_count : 0);
+		printf("Handshake tags: %zu\n", tag_count);
+
+		if(info.tag_count) {
+			for(size_t i = 0; i < info.tag_count; ++i) {
+				const char *name = info.tag_names[i] ? info.tag_names[i] : "(unnamed)";
+				printf("  %s: %s\n", name, info.tag_patterns[i]);
+			}
+		}
+
+		goto status_cleanup;
+	status_cleanup:
+		if(info.tag_names) {
+			for(size_t i = 0; i < info.tag_count; ++i) {
+				free(info.tag_names[i]);
+				free(info.tag_patterns[i]);
+			}
+			free(info.tag_names);
+			free(info.tag_patterns);
+		}
+
+		return rc;
+	}
+
+	if(!strcasecmp(sub, "tag")) {
+		if(argc < 3) {
+			fprintf(stderr, "Usage: obfs tag <add|clear> [...].\n");
+			return 1;
+		}
+
+		const char *tag_cmd = argv[2];
+
+		if(!strcasecmp(tag_cmd, "clear")) {
+			if(argc != 3) {
+				fprintf(stderr, "Usage: obfs tag clear\n");
+				return 1;
+			}
+
+			if(!connect_tincd(true)) {
+				return 1;
+			}
+
+			sendline(fd, "%d %d %s", CONTROL, REQ_OBFS_APPLY, "tags_clear=1");
+
+			int code;
+			int req;
+			int result;
+
+			if(!recvline(fd, line, sizeof(line)) || sscanf(line, "%d %d %d", &code, &req, &result) != 3 || code != CONTROL || req != REQ_OBFS_APPLY) {
+				fprintf(stderr, "Failed to clear handshake tags.\n");
+				return 1;
+			}
+
+			if(result) {
+				fprintf(stderr, "Daemon rejected tag clear (error %d).\n", result);
+				return 1;
+			}
+
+			return 0;
+		}
+
+		if(!strcasecmp(tag_cmd, "add")) {
+			if(argc < 4) {
+				fprintf(stderr, "Usage: obfs tag add [--name NAME] PATTERN\n");
+				return 1;
+			}
+
+			const char *name = NULL;
+			const char *pattern = NULL;
+
+			for(int i = 3; i < argc; ++i) {
+				const char *arg = argv[i];
+
+				if(!strncmp(arg, "--name=", 7)) {
+					name = arg + 7;
+					continue;
+				}
+
+				if(!strcmp(arg, "--name")) {
+					if(++i >= argc) {
+						fprintf(stderr, "--name requires a value.\n");
+						return 1;
+					}
+
+					name = argv[i];
+					continue;
+				}
+
+				if(!pattern) {
+					pattern = arg;
+					continue;
+				}
+
+				fprintf(stderr, "Too many arguments for obfs tag add.\n");
+				return 1;
+			}
+
+			if(!pattern) {
+				fprintf(stderr, "Usage: obfs tag add [--name NAME] PATTERN\n");
+				return 1;
+			}
+
+			if(name && !check_id(name)) {
+				fprintf(stderr, "Invalid tag name '%s'.\n", name);
+				return 1;
+			}
+
+			size_t pattern_len = strlen(pattern);
+			size_t encoded_len = pattern_len / 3 * 4 + 4;
+			char *encoded = xmalloc(encoded_len + 1);
+			size_t produced = b64encode(pattern, encoded, pattern_len);
+			encoded[produced] = '\0';
+
+			char *payload = NULL;
+
+			if(name) {
+				size_t payload_len = strlen(name) + 1 + produced + strlen("add_tag_named_b64=") + 1;
+				payload = xmalloc(payload_len);
+				snprintf(payload, payload_len, "add_tag_named_b64=%s:%s", name, encoded);
+			} else {
+				size_t payload_len = produced + strlen("add_tag_b64=") + 1;
+				payload = xmalloc(payload_len);
+				snprintf(payload, payload_len, "add_tag_b64=%s", encoded);
+			}
+
+			if(!connect_tincd(true)) {
+				free(encoded);
+				free(payload);
+				return 1;
+			}
+
+			sendline(fd, "%d %d %s", CONTROL, REQ_OBFS_APPLY, payload);
+
+			free(encoded);
+			free(payload);
+
+			int code;
+			int req;
+			int result;
+
+			if(!recvline(fd, line, sizeof(line)) || sscanf(line, "%d %d %d", &code, &req, &result) != 3 || code != CONTROL || req != REQ_OBFS_APPLY) {
+				fprintf(stderr, "Failed to add handshake tag.\n");
+				return 1;
+			}
+
+			if(result) {
+				fprintf(stderr, "Daemon rejected handshake tag (error %d).\n", result);
+				return 1;
+			}
+
+			return 0;
+		}
+
+		fprintf(stderr, "Unknown obfs tag subcommand '%s'.\n", tag_cmd);
+		return 1;
+	}
+
+	if(!strcasecmp(sub, "enable") || !strcasecmp(sub, "disable")) {
+		if(argc != 2) {
+			fprintf(stderr, "Usage: obfs %s\n", sub);
+			return 1;
+		}
+
+		if(!connect_tincd(true)) {
+			return 1;
+		}
+
+		bool enable = !strcasecmp(sub, "enable");
+		char payload[32];
+		int len = snprintf(payload, sizeof(payload), "enabled=%d", enable ? 1 : 0);
+
+		if(len <= 0 || (size_t)len >= sizeof(payload)) {
+			fprintf(stderr, "Internal error building command.\n");
+			return 1;
+		}
+
+		sendline(fd, "%d %d %s", CONTROL, REQ_OBFS_APPLY, payload);
+
+		int code;
+		int req;
+		int result;
+
+		if(!recvline(fd, line, sizeof(line)) || sscanf(line, "%d %d %d", &code, &req, &result) != 3 || code != CONTROL || req != REQ_OBFS_APPLY || result) {
+			fprintf(stderr, "Failed to %s obfuscation.\n", enable ? "enable" : "disable");
+			return 1;
+		}
+
+		return 0;
+	}
+
+	if(!strcasecmp(sub, "set")) {
+		if(argc != 4) {
+			fprintf(stderr, "Usage: obfs set <key> <value>\n");
+			return 1;
+		}
+
+		const char *wire_key = obfs_map_cli_key(argv[2]);
+
+		if(!wire_key) {
+			fprintf(stderr, "Unknown obfs key '%s'.\n", argv[2]);
+			return 1;
+		}
+
+		if(!obfs_check_whitespace(argv[3])) {
+			fprintf(stderr, "Values must not contain whitespace.\n");
+			return 1;
+		}
+
+		if(!connect_tincd(true)) {
+			return 1;
+		}
+
+		char payload[256];
+		int len = snprintf(payload, sizeof(payload), "%s=%s", wire_key, argv[3]);
+
+		if(len <= 0 || (size_t)len >= sizeof(payload)) {
+			fprintf(stderr, "Value too long.\n");
+			return 1;
+		}
+
+		sendline(fd, "%d %d %s", CONTROL, REQ_OBFS_APPLY, payload);
+
+		int code;
+		int req;
+		int result;
+
+		if(!recvline(fd, line, sizeof(line)) || sscanf(line, "%d %d %d", &code, &req, &result) != 3 || code != CONTROL || req != REQ_OBFS_APPLY) {
+			fprintf(stderr, "Failed to update obfuscation setting.\n");
+			return 1;
+		}
+
+		if(result) {
+			fprintf(stderr, "tincd rejected the new value (error %d).\n", result);
+			return 1;
+		}
+
+		return 0;
+	}
+
+	fprintf(stderr, "Unknown obfs subcommand '%s'.\n", sub);
+	return 1;
+}
+
 static int cmd_pid(int argc, char *argv[]) {
 	(void)argv;
 
@@ -3034,6 +3569,7 @@ static const struct {
 	{"top", cmd_top, false},
 	{"pcap", cmd_pcap, false},
 	{"log", cmd_log, false},
+	{"obfs", cmd_obfs, false},
 	{"pid", cmd_pid, false},
 	{"config", cmd_config, true},
 	{"add", cmd_config, false},

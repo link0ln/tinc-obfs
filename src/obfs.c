@@ -516,6 +516,63 @@ static void obfs_fill_random_digits(uint8_t *dest, size_t len) {
 	obfs_free_blob(&temp);
 }
 
+static bool obfs_emit_generators(const obfs_tag_def_t *def, uint8_t **cursor_ptr) {
+	if(!def || !cursor_ptr) {
+		return false;
+	}
+
+	uint8_t *cursor = *cursor_ptr;
+
+	for(size_t j = 0; j < def->generator_count; ++j) {
+		obfs_tag_generator_t *gen = &def->generators[j];
+
+		switch(gen->kind) {
+		case OBFS_TAG_BYTES:
+			if(gen->literal.data && gen->literal.len) {
+				memcpy(cursor, gen->literal.data, gen->literal.len);
+				cursor += gen->literal.len;
+			}
+			break;
+
+		case OBFS_TAG_COUNTER: {
+			uint64_t value = obfs_hton64(++obfs_packet_counter);
+			memcpy(cursor, &value, sizeof(value));
+			cursor += sizeof(value);
+			break;
+		}
+
+		case OBFS_TAG_TIMESTAMP: {
+			uint64_t timestamp = (uint64_t)time(NULL);
+			timestamp = obfs_hton64(timestamp);
+			memcpy(cursor, &timestamp, sizeof(timestamp));
+			cursor += sizeof(timestamp);
+			break;
+		}
+
+		case OBFS_TAG_RANDOM_BYTES:
+			randomize(cursor, (size_t)gen->param);
+			cursor += (size_t)gen->param;
+			break;
+
+		case OBFS_TAG_RANDOM_ASCII:
+			obfs_fill_random_ascii(cursor, (size_t)gen->param);
+			cursor += (size_t)gen->param;
+			break;
+
+		case OBFS_TAG_RANDOM_DIGIT:
+			obfs_fill_random_digits(cursor, (size_t)gen->param);
+			cursor += (size_t)gen->param;
+			break;
+
+		default:
+			return false;
+		}
+	}
+
+	*cursor_ptr = cursor;
+	return true;
+}
+
 obfs_blob_t obfs_create_header_junk(obfs_message_kind_t kind) {
 	obfs_blob_t blob = {0};
 
@@ -638,6 +695,13 @@ bool obfs_append_tag_definition(const char *name, const char *pattern, char **er
 	return true;
 }
 
+bool obfs_validate_handshake_pattern(const char *pattern, char **error_out) {
+	obfs_tag_def_t temp = {0};
+	bool ok = obfs_compile_handshake_pattern(&temp, pattern, error_out);
+	obfs_free_tag(&temp);
+	return ok;
+}
+
 obfs_message_kind_t obfs_classify_sptps_type(int type) {
 	if(type == SPTPS_HANDSHAKE) {
 		return OBFS_MESSAGE_INIT;
@@ -650,7 +714,41 @@ obfs_message_kind_t obfs_classify_sptps_type(int type) {
 	return OBFS_MESSAGE_TRANSPORT;
 }
 
-bool obfs_strip_prefix(const uint8_t **data, size_t *len) {
+bool obfs_choose_datagram_type(obfs_message_kind_t kind, uint8_t default_type, uint8_t *wire_type) {
+	if(!wire_type) {
+		return false;
+	}
+
+	*wire_type = default_type;
+
+	if(!obfs_config.enabled || kind >= OBFS_MESSAGE_KIND_COUNT) {
+		return false;
+	}
+
+	obfs_magic_range_t *range = &obfs_config.header_magic[kind];
+
+	if(!range->enabled) {
+		return false;
+	}
+
+	uint32_t candidate = obfs_pick_magic_value(kind, default_type);
+
+	if(candidate > UINT8_MAX) {
+		logger(DEBUG_ALWAYS, LOG_WARNING, "Obfs: magic header value %u exceeds 8-bit range, falling back", candidate);
+		return false;
+	}
+
+	*wire_type = (uint8_t)candidate;
+	return *wire_type != default_type;
+}
+
+bool obfs_strip_prefix(uint8_t **data, size_t *len, obfs_prefix_info_t *info) {
+	if(info) {
+		info->has_original_type = false;
+		info->original_type = 0;
+		info->is_junk = false;
+	}
+
 	if(!obfs_config.enabled) {
 		return true;
 	}
@@ -664,16 +762,48 @@ bool obfs_strip_prefix(const uint8_t **data, size_t *len) {
 		return false;
 	}
 
-	uint16_t declared = ntohs(*(const uint16_t *)*data);
-	const size_t header = sizeof(uint16_t) + (size_t)declared;
+	uint8_t *cursor = *data;
+	uint16_t declared_value;
+	memcpy(&declared_value, cursor, sizeof(declared_value));
+	uint16_t declared = ntohs(declared_value);
+	cursor += sizeof(uint16_t);
 
-	if(*len < header) {
+	if(*len < sizeof(uint16_t) + (size_t)declared) {
 		logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: junk length %u exceeds datagram size %zu", declared, *len);
 		return false;
 	}
 
-	*data += header;
-	*len -= header;
+	size_t remaining = declared;
+
+	if(remaining > 0) {
+		uint8_t flags = *cursor++;
+		remaining--;
+
+		if(info) {
+			info->has_original_type = flags & OBFS_PREFIX_FLAG_HAS_TYPE;
+			info->is_junk = flags & OBFS_PREFIX_FLAG_JUNK;
+		}
+
+		if((flags & OBFS_PREFIX_FLAG_HAS_TYPE)) {
+			if(remaining == 0) {
+				logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: prefix missing stored type byte");
+				return false;
+			}
+
+			uint8_t stored_type = *cursor++;
+			remaining--;
+
+			if(info) {
+				info->original_type = stored_type;
+			}
+		}
+
+		cursor += remaining;
+		remaining = 0;
+	}
+
+	*data += sizeof(uint16_t) + declared;
+	*len -= sizeof(uint16_t) + declared;
 	return true;
 }
 
@@ -698,51 +828,54 @@ obfs_blob_t obfs_build_handshake_tags(void) {
 	uint8_t *cursor = blob.data;
 
 	for(size_t i = 0; i < obfs_config.handshake_tags.count; ++i) {
-		obfs_tag_def_t *def = &obfs_config.handshake_tags.items[i];
+		obfs_blob_t packet = {0};
 
-		for(size_t j = 0; j < def->generator_count; ++j) {
-			obfs_tag_generator_t *gen = &def->generators[j];
-
-			switch(gen->kind) {
-			case OBFS_TAG_BYTES:
-				if(gen->literal.data && gen->literal.len) {
-					memcpy(cursor, gen->literal.data, gen->literal.len);
-					cursor += gen->literal.len;
-				}
-				break;
-
-			case OBFS_TAG_COUNTER: {
-				uint64_t value = obfs_hton64(++obfs_packet_counter);
-				memcpy(cursor, &value, sizeof(value));
-				cursor += sizeof(value);
-				break;
-			}
-
-			case OBFS_TAG_TIMESTAMP: {
-				uint64_t timestamp = (uint64_t)time(NULL);
-				timestamp = obfs_hton64(timestamp);
-				memcpy(cursor, &timestamp, sizeof(timestamp));
-				cursor += sizeof(timestamp);
-				break;
-			}
-
-			case OBFS_TAG_RANDOM_BYTES:
-				randomize(cursor, (size_t)gen->param);
-				cursor += (size_t)gen->param;
-				break;
-
-			case OBFS_TAG_RANDOM_ASCII:
-				obfs_fill_random_ascii(cursor, (size_t)gen->param);
-				cursor += (size_t)gen->param;
-				break;
-
-			case OBFS_TAG_RANDOM_DIGIT:
-				obfs_fill_random_digits(cursor, (size_t)gen->param);
-				cursor += (size_t)gen->param;
-				break;
-			}
+		if(!obfs_build_handshake_packet(i, &packet)) {
+			obfs_free_blob(&blob);
+			return (obfs_blob_t){0};
 		}
+
+		if(packet.len) {
+			memcpy(cursor, packet.data, packet.len);
+			cursor += packet.len;
+		}
+
+		obfs_free_blob(&packet);
 	}
 
 	return blob;
+}
+
+size_t obfs_handshake_packet_count(void) {
+	return obfs_config.handshake_tags.count;
+}
+
+bool obfs_build_handshake_packet(size_t index, obfs_blob_t *out) {
+	if(!out) {
+		return false;
+	}
+
+	if(index >= obfs_config.handshake_tags.count) {
+		*out = (obfs_blob_t){0};
+		return false;
+	}
+
+	obfs_tag_def_t *def = &obfs_config.handshake_tags.items[index];
+	obfs_blob_t blob = obfs_new_blob(def->total_size);
+
+	if(def->total_size > 0) {
+		if(!blob.data) {
+			return false;
+		}
+
+		uint8_t *cursor = blob.data;
+
+		if(!obfs_emit_generators(def, &cursor)) {
+			obfs_free_blob(&blob);
+			return false;
+		}
+	}
+
+	*out = blob;
+	return true;
 }

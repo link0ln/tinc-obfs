@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     liblzo2-dev \
     libncurses5-dev \
     libreadline-dev \
+    texinfo \
     iproute2 \
     iputils-ping \
     net-tools \

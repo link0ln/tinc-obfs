@@ -40,6 +40,15 @@ typedef struct {
     size_t len;
 } obfs_blob_t;
 
+typedef struct {
+    bool has_original_type;
+    uint8_t original_type;
+    bool is_junk;
+} obfs_prefix_info_t;
+
+#define OBFS_PREFIX_FLAG_HAS_TYPE 0x01
+#define OBFS_PREFIX_FLAG_JUNK 0x02
+
 typedef enum {
     OBFS_TAG_BYTES,
     OBFS_TAG_COUNTER,
@@ -98,12 +107,16 @@ void obfs_set_magic_range(obfs_message_kind_t kind, uint32_t min_value, uint32_t
 
 void obfs_clear_tags(void);
 bool obfs_append_tag_definition(const char *name, const char *pattern, char **error_out);
+bool obfs_validate_handshake_pattern(const char *pattern, char **error_out);
 
 bool obfs_is_enabled(void);
 size_t obfs_header_junk_size(obfs_message_kind_t kind);
 obfs_message_kind_t obfs_classify_sptps_type(int type);
-bool obfs_strip_prefix(const uint8_t **data, size_t *len);
+bool obfs_choose_datagram_type(obfs_message_kind_t kind, uint8_t default_type, uint8_t *wire_type);
+bool obfs_strip_prefix(uint8_t **data, size_t *len, obfs_prefix_info_t *info);
 size_t obfs_handshake_tag_size(void);
 obfs_blob_t obfs_build_handshake_tags(void);
+size_t obfs_handshake_packet_count(void);
+bool obfs_build_handshake_packet(size_t index, obfs_blob_t *out);
 
 #endif /* TINC_OBFS_H */
