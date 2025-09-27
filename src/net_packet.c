@@ -45,6 +45,7 @@
 #include "logger.h"
 #include "net.h"
 #include "netutl.h"
+#include "obfs.h"
 #include "protocol.h"
 #include "route.h"
 #include "utils.h"
@@ -327,7 +328,18 @@ static bool receive_udppacket(node_t *n, vpn_packet_t *inpkt) {
 		}
 
 		n->status.udppacket = true;
-		bool result = sptps_receive_data(&n->sptps, DATA(inpkt), inpkt->len);
+		const uint8_t *payload = DATA(inpkt);
+		size_t payload_len = inpkt->len;
+
+		if(obfs_is_enabled()) {
+			if(!obfs_strip_prefix(&payload, &payload_len)) {
+				n->status.udppacket = false;
+				logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: dropping malformed datagram from %s (%s)", n->name, n->hostname);
+				return false;
+			}
+		}
+
+		bool result = sptps_receive_data(&n->sptps, payload, payload_len);
 		n->status.udppacket = false;
 
 		if(!result) {
@@ -867,10 +879,45 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 	bool direct = from == myself && to == relay;
 	bool relay_supported = (relay->options >> 24) >= 4;
 	bool tcponly = (myself->options | relay->options) & OPTION_TCPONLY;
+	obfs_blob_t header_junk = {0};
+	obfs_blob_t handshake_tags = {0};
+	size_t prefix_len = 0;
+	bool use_obfs = obfs_is_enabled();
+
+	if(use_obfs) {
+		obfs_message_kind_t kind = obfs_classify_sptps_type(type);
+		size_t configured = obfs_header_junk_size(kind);
+
+		if(configured > UINT16_MAX) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "Obfs junk size %zu exceeds limit", configured);
+			return false;
+		}
+
+		header_junk = obfs_create_header_junk(kind);
+
+		if(type == SPTPS_HANDSHAKE) {
+			handshake_tags = obfs_build_handshake_tags();
+		}
+
+		if(header_junk.len > UINT16_MAX - handshake_tags.len) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "Obfs prefix length exceeds 16-bit limit");
+			obfs_free_blob(&header_junk);
+			obfs_free_blob(&handshake_tags);
+			return false;
+		}
+
+		prefix_len = sizeof(uint16_t) + header_junk.len + handshake_tags.len;
+	}
 
 	/* Send it via TCP if it is a handshake packet, TCPOnly is in use, this is a relay packet that the other node cannot understand, or this packet is larger than the MTU. */
 
-	if(type == SPTPS_HANDSHAKE || tcponly || (!direct && !relay_supported) || (type != PKT_PROBE && (len - SPTPS_DATAGRAM_OVERHEAD) > relay->minmtu)) {
+	bool force_udp_handshake = false;
+
+	if(use_obfs && type == SPTPS_HANDSHAKE) {
+		force_udp_handshake = header_junk.len > 0 || handshake_tags.len > 0;
+	}
+
+	if((type == SPTPS_HANDSHAKE && !force_udp_handshake) || tcponly || (!direct && !relay_supported) || (type != PKT_PROBE && (len - SPTPS_DATAGRAM_OVERHEAD) > relay->minmtu)) {
 		if(type != SPTPS_HANDSHAKE && (to->nexthop->connection->options >> 24) >= 7) {
 			char buf[len + sizeof(to->id) + sizeof(from->id)];
 			char *buf_ptr = buf;
@@ -880,7 +927,10 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 			buf_ptr += sizeof(from->id);
 			memcpy(buf_ptr, data, len);
 			logger(DEBUG_TRAFFIC, LOG_INFO, "Sending packet from %s (%s) to %s (%s) via %s (%s) (TCP)", from->name, from->hostname, to->name, to->hostname, to->nexthop->name, to->nexthop->hostname);
-			return send_sptps_tcppacket(to->nexthop->connection, buf, sizeof(buf));
+			bool tcp_success = send_sptps_tcppacket(to->nexthop->connection, buf, sizeof(buf));
+			obfs_free_blob(&header_junk);
+			obfs_free_blob(&handshake_tags);
+			return tcp_success;
 		}
 
 		char buf[len * 4 / 3 + 5];
@@ -889,12 +939,17 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 		/* If this is a handshake packet, use ANS_KEY instead of REQ_KEY, for two reasons:
 		    - We don't want intermediate nodes to switch to UDP to relay these packets;
 		    - ANS_KEY allows us to learn the reflexive UDP address. */
+		bool request_success;
 		if(type == SPTPS_HANDSHAKE) {
 			to->incompression = myself->incompression;
-			return send_request(to->nexthop->connection, "%d %s %s %s -1 -1 -1 %d", ANS_KEY, from->name, to->name, buf, to->incompression);
+			request_success = send_request(to->nexthop->connection, "%d %s %s %s -1 -1 -1 %d", ANS_KEY, from->name, to->name, buf, to->incompression);
 		} else {
-			return send_request(to->nexthop->connection, "%d %s %s %d %s", REQ_KEY, from->name, to->name, SPTPS_PACKET, buf);
+			request_success = send_request(to->nexthop->connection, "%d %s %s %d %s", REQ_KEY, from->name, to->name, SPTPS_PACKET, buf);
 		}
+
+		obfs_free_blob(&header_junk);
+		obfs_free_blob(&handshake_tags);
+		return request_success;
 	}
 
 	size_t overhead = 0;
@@ -903,7 +958,7 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 		overhead += sizeof(to->id) + sizeof(from->id);
 	}
 
-	char buf[len + overhead];
+	char buf[len + overhead + prefix_len];
 	char *buf_ptr = buf;
 
 	if(relay_supported) {
@@ -920,6 +975,22 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 		memcpy(buf_ptr, &from->id, sizeof(from->id));
 		buf_ptr += sizeof(from->id);
 
+	}
+
+	if(use_obfs) {
+		uint16_t junk_total = htons((uint16_t)(header_junk.len + handshake_tags.len));
+		memcpy(buf_ptr, &junk_total, sizeof(junk_total));
+		buf_ptr += sizeof(junk_total);
+
+		if(header_junk.len) {
+			memcpy(buf_ptr, header_junk.data, header_junk.len);
+			buf_ptr += header_junk.len;
+		}
+
+		if(handshake_tags.len) {
+			memcpy(buf_ptr, handshake_tags.data, handshake_tags.len);
+			buf_ptr += handshake_tags.len;
+		}
 	}
 
 	/* TODO: if this copy turns out to be a performance concern, change sptps_send_record() to add some "pre-padding" to the buffer and use that instead */
@@ -939,7 +1010,9 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 
 	logger(DEBUG_TRAFFIC, LOG_INFO, "Sending packet from %s (%s) to %s (%s) via %s (%s) (UDP)", from->name, from->hostname, to->name, to->hostname, relay->name, relay->hostname);
 
-	if(sendto(listen_socket[sock].udp.fd, buf, buf_ptr - buf, 0, &sa->sa, SALEN(sa->sa)) < 0 && !sockwouldblock(sockerrno)) {
+	size_t udp_len = buf_ptr - buf;
+
+	if(sendto(listen_socket[sock].udp.fd, buf, udp_len, 0, &sa->sa, SALEN(sa->sa)) < 0 && !sockwouldblock(sockerrno)) {
 		if(sockmsgsize(sockerrno)) {
 			// Compensate for SPTPS overhead
 			len -= SPTPS_DATAGRAM_OVERHEAD;
@@ -955,10 +1028,13 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 			try_fix_mtu(relay);
 		} else {
 			logger(DEBUG_TRAFFIC, LOG_WARNING, "Error sending UDP SPTPS packet to %s (%s): %s", relay->name, relay->hostname, sockstrerror(sockerrno));
+			obfs_free_blob(&header_junk);
+			obfs_free_blob(&handshake_tags);
 			return false;
 		}
 	}
-
+	obfs_free_blob(&header_junk);
+	obfs_free_blob(&handshake_tags);
 	return true;
 }
 

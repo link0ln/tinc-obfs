@@ -34,10 +34,15 @@
 #include "names.h"
 #include "net.h"
 #include "netutl.h"
+#include "obfs.h"
 #include "process.h"
 #include "protocol.h"
 #include "route.h"
 #include "rsa.h"
+
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include "script.h"
 #include "subnet.h"
 #include "utils.h"
@@ -62,6 +67,263 @@ bool disablebuggypeers;
 
 char *scriptinterpreter;
 char *scriptextension;
+
+static char *trim_whitespace(char *text) {
+	if(!text) {
+		return NULL;
+	}
+
+	while(*text && isspace((unsigned char)*text)) {
+		++text;
+	}
+
+	char *end = text + strlen(text);
+
+	while(end > text && isspace((unsigned char)end[-1])) {
+		--end;
+	}
+
+	*end = '\0';
+	return text;
+}
+
+static bool parse_uint32_token(const char *input, uint32_t *value_out) {
+	if(!input || !value_out) {
+		return false;
+	}
+
+	char *copy = xstrdup(input);
+	char *trimmed = trim_whitespace(copy);
+
+	if(!*trimmed) {
+		free(copy);
+		return false;
+	}
+
+	errno = 0;
+	char *endptr = NULL;
+	unsigned long value = strtoul(trimmed, &endptr, 10);
+
+	if(errno || endptr == trimmed) {
+		free(copy);
+		return false;
+	}
+
+	char *rest = trim_whitespace(endptr);
+	bool ok = !*rest && value <= UINT32_MAX;
+
+	if(ok) {
+		*value_out = (uint32_t)value;
+	}
+
+	free(copy);
+	return ok;
+}
+
+static bool parse_range_string(const char *input, uint32_t *min_out, uint32_t *max_out) {
+	if(!input || !min_out || !max_out) {
+		return false;
+	}
+
+	char *copy = xstrdup(input);
+	char *work = trim_whitespace(copy);
+
+	if(!*work) {
+		free(copy);
+		return false;
+	}
+
+	char *dash = strchr(work, '-');
+	uint32_t min_value;
+	uint32_t max_value;
+
+	if(!dash) {
+		bool ok = parse_uint32_token(work, &min_value);
+		if(ok) {
+			max_value = min_value;
+		}
+		free(copy);
+		if(ok) {
+			*min_out = min_value;
+			*max_out = max_value;
+		}
+		return ok;
+	}
+
+	*dash = '\0';
+	char *left = trim_whitespace(work);
+	char *right = trim_whitespace(dash + 1);
+
+	bool ok_left = parse_uint32_token(left, &min_value);
+	bool ok_right = parse_uint32_token(right, &max_value);
+
+	free(copy);
+
+	if(!ok_left || !ok_right || min_value > max_value) {
+		return false;
+	}
+
+	*min_out = min_value;
+	*max_out = max_value;
+	return true;
+}
+
+static bool apply_obfs_config(void) {
+	obfs_reset();
+	bool saw_option = false;
+	int int_value;
+
+	if(get_config_int(lookup_config(config_tree, "ObfsJunkPacketCount"), &int_value)) {
+		if(int_value < 0) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "ObfsJunkPacketCount cannot be negative");
+			return false;
+		}
+
+		obfs_config.junk_packet_count = int_value;
+		saw_option = true;
+	}
+
+	if(get_config_int(lookup_config(config_tree, "ObfsJunkPacketMinSize"), &int_value)) {
+		if(int_value < 0) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "ObfsJunkPacketMinSize cannot be negative");
+			return false;
+		}
+
+		obfs_config.junk_packet_min_size = int_value;
+		saw_option = true;
+	}
+
+	if(get_config_int(lookup_config(config_tree, "ObfsJunkPacketMaxSize"), &int_value)) {
+		if(int_value < 0) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "ObfsJunkPacketMaxSize cannot be negative");
+			return false;
+		}
+
+		obfs_config.junk_packet_max_size = int_value;
+		saw_option = true;
+	}
+
+	struct {
+		const char *key;
+		obfs_message_kind_t kind;
+	} header_sizes[] = {
+		{ "ObfsInitHeaderJunkSize", OBFS_MESSAGE_INIT },
+		{ "ObfsResponseHeaderJunkSize", OBFS_MESSAGE_RESPONSE },
+		{ "ObfsCookieHeaderJunkSize", OBFS_MESSAGE_COOKIE },
+		{ "ObfsTransportHeaderJunkSize", OBFS_MESSAGE_TRANSPORT },
+	};
+
+	for(size_t i = 0; i < sizeof(header_sizes) / sizeof(header_sizes[0]); ++i) {
+		if(get_config_int(lookup_config(config_tree, (char *)header_sizes[i].key), &int_value)) {
+			if(int_value < 0) {
+				logger(DEBUG_ALWAYS, LOG_ERR, "%s cannot be negative", header_sizes[i].key);
+				return false;
+			}
+
+			if(int_value >= MTU) {
+				logger(DEBUG_ALWAYS, LOG_ERR, "%s must be smaller than MTU (%d)", header_sizes[i].key, MTU);
+				return false;
+			}
+
+			obfs_config.header_junk[header_sizes[i].kind] = int_value;
+			saw_option = true;
+		}
+	}
+
+	struct {
+		const char *key;
+		obfs_message_kind_t kind;
+	} magic_ranges[] = {
+		{ "ObfsInitMagicHeader", OBFS_MESSAGE_INIT },
+		{ "ObfsResponseMagicHeader", OBFS_MESSAGE_RESPONSE },
+		{ "ObfsCookieMagicHeader", OBFS_MESSAGE_COOKIE },
+		{ "ObfsTransportMagicHeader", OBFS_MESSAGE_TRANSPORT },
+	};
+
+	for(size_t i = 0; i < sizeof(magic_ranges) / sizeof(magic_ranges[0]); ++i) {
+		config_t *cfg = lookup_config(config_tree, (char *)magic_ranges[i].key);
+
+		if(!cfg) {
+			continue;
+		}
+
+		do {
+			uint32_t min_value;
+			uint32_t max_value;
+
+			if(!parse_range_string(cfg->value, &min_value, &max_value)) {
+				logger(DEBUG_ALWAYS, LOG_ERR, "Invalid value for %s: %s", magic_ranges[i].key, cfg->value);
+				return false;
+			}
+
+			obfs_set_magic_range(magic_ranges[i].kind, min_value, max_value);
+			saw_option = true;
+		} while((cfg = lookup_config_next(config_tree, cfg)));
+	}
+
+	size_t tag_index = 0;
+
+	for(config_t *cfg = lookup_config(config_tree, "ObfsHandshakeTag"); cfg; cfg = lookup_config_next(config_tree, cfg)) {
+		char namebuf[32];
+		snprintf(namebuf, sizeof(namebuf), "tag%zu", tag_index + 1);
+
+		char *err = NULL;
+
+		if(!obfs_append_tag_definition(namebuf, cfg->value, &err)) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "Invalid ObfsHandshakeTag: %s", err ? err : cfg->value);
+			free(err);
+			return false;
+		}
+
+		free(err);
+		saw_option = true;
+		++tag_index;
+	}
+
+	if(obfs_config.junk_packet_count > 0) {
+		if(!obfs_config.junk_packet_min_size || !obfs_config.junk_packet_max_size) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "Obfs junk packet count set but size range incomplete");
+			return false;
+		}
+
+		if(obfs_config.junk_packet_min_size > obfs_config.junk_packet_max_size) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "Obfs junk packet min size (%d) cannot exceed max size (%d)",
+			       obfs_config.junk_packet_min_size, obfs_config.junk_packet_max_size);
+			return false;
+		}
+
+		if(obfs_config.junk_packet_max_size >= MTU) {
+			logger(DEBUG_ALWAYS, LOG_ERR, "Obfs junk packet max size must be smaller than MTU (%d)", MTU);
+			return false;
+		}
+	}
+
+	obfs_config.enabled = false;
+
+	if(obfs_config.junk_packet_count > 0 ||
+	   obfs_config.junk_packet_min_size > 0 ||
+	   obfs_config.junk_packet_max_size > 0) {
+		obfs_config.enabled = true;
+	}
+
+	for(size_t i = 0; i < OBFS_MESSAGE_KIND_COUNT && !obfs_config.enabled; ++i) {
+		if(obfs_config.header_junk[i] > 0 || obfs_config.header_magic[i].enabled) {
+			obfs_config.enabled = true;
+		}
+	}
+
+	if(!obfs_config.enabled && obfs_config.handshake_tags.count > 0) {
+		obfs_config.enabled = true;
+	}
+
+	if(obfs_config.enabled) {
+		logger(DEBUG_STATUS, LOG_INFO, "Traffic obfuscation enabled");
+	} else if(saw_option) {
+		logger(DEBUG_STATUS, LOG_INFO, "Traffic obfuscation disabled (no active options)");
+	}
+
+	return true;
+}
 
 bool node_read_ecdsa_public_key(node_t *n) {
 	if(ecdsa_active(n->ecdsa)) {
@@ -699,6 +961,10 @@ bool setup_myself_reloadable(void) {
 		invitation_lifetime = 604800;        // 1 week
 	}
 
+	if(!apply_obfs_config()) {
+		return false;
+	}
+
 	read_invitation_key();
 
 	return true;
@@ -1217,6 +1483,7 @@ static bool setup_myself(void) {
   initialize network
 */
 bool setup_network(void) {
+	obfs_init();
 	init_connections();
 	init_subnets();
 	init_nodes();

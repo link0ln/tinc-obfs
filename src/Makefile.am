@@ -76,6 +76,7 @@ tincd_SOURCES = \
 	net_packet.c \
 	net_setup.c \
 	net_socket.c \
+	obfs.c obfs.h \
 	netutl.c netutl.h \
 	node.c node.h \
 	prf.h \
