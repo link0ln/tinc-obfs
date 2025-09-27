@@ -1,6 +1,6 @@
 FROM ubuntu:22.04
 
-# Install build dependencies
+# Install build dependencies and runtime utilities
 RUN apt-get update && apt-get install -y \
     build-essential \
     autoconf \
@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y \
     liblzo2-dev \
     libncurses5-dev \
     libreadline-dev \
+    iproute2 \
+    iputils-ping \
+    net-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
