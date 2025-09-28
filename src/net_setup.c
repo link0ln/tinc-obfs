@@ -298,6 +298,58 @@ static bool apply_obfs_config(void) {
 		}
 	}
 
+	static const char *const kind_names[OBFS_MESSAGE_KIND_COUNT] = {
+		"init",
+		"response",
+		"cookie",
+		"transport",
+	};
+
+	size_t prefix_signature[OBFS_MESSAGE_KIND_COUNT] = {0};
+	size_t handshake_total = obfs_handshake_tag_size();
+
+	for(obfs_message_kind_t kind = 0; kind < OBFS_MESSAGE_KIND_COUNT; ++kind) {
+		bool has_features = obfs_config.header_junk[kind] > 0 || obfs_config.header_magic[kind].enabled;
+		if(kind == OBFS_MESSAGE_INIT && handshake_total > 0) {
+			has_features = true;
+		}
+
+		if(!has_features) {
+			continue;
+		}
+
+		size_t metadata_len = 1;
+		if(obfs_config.header_magic[kind].enabled) {
+			metadata_len += 1;
+		}
+
+		size_t payload_len = metadata_len + (size_t)obfs_config.header_junk[kind];
+		if(kind == OBFS_MESSAGE_INIT) {
+			payload_len += handshake_total;
+		}
+
+		prefix_signature[kind] = sizeof(uint16_t) + payload_len;
+	}
+
+	for(obfs_message_kind_t lhs = 0; lhs < OBFS_MESSAGE_KIND_COUNT; ++lhs) {
+		if(!prefix_signature[lhs]) {
+			continue;
+		}
+
+		for(obfs_message_kind_t rhs = lhs + 1; rhs < OBFS_MESSAGE_KIND_COUNT; ++rhs) {
+			if(!prefix_signature[rhs]) {
+				continue;
+			}
+
+			if(prefix_signature[lhs] == prefix_signature[rhs]) {
+				logger(DEBUG_ALWAYS, LOG_ERR,
+				       "Obfs prefix length collision between %s and %s (%zu bytes)",
+				       kind_names[lhs], kind_names[rhs], prefix_signature[lhs]);
+				return false;
+			}
+		}
+	}
+
 	obfs_config.enabled = false;
 
 	if(obfs_config.junk_packet_count > 0 ||

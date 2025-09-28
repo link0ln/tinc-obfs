@@ -22,6 +22,22 @@ static uint32_t obfs_random_u32(void) {
 	return value;
 }
 
+uint64_t obfs_counter_next_value(void) {
+	return obfs_packet_counter + 1;
+}
+
+void obfs_record_sent_packet(void) {
+	obfs_record_sent_packets(1);
+}
+
+void obfs_record_sent_packets(size_t count) {
+	if(!count) {
+		return;
+	}
+
+	obfs_packet_counter += count;
+}
+
 static obfs_blob_t obfs_new_blob(size_t size);
 
 static const char obfs_alnum_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -535,7 +551,7 @@ static bool obfs_emit_generators(const obfs_tag_def_t *def, uint8_t **cursor_ptr
 			break;
 
 		case OBFS_TAG_COUNTER: {
-			uint64_t value = obfs_hton64(++obfs_packet_counter);
+			uint64_t value = obfs_hton64(obfs_counter_next_value());
 			memcpy(cursor, &value, sizeof(value));
 			cursor += sizeof(value);
 			break;

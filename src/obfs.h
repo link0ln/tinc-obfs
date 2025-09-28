@@ -99,6 +99,10 @@ obfs_blob_t obfs_create_header_junk(obfs_message_kind_t kind);
 obfs_blob_t obfs_create_junk_packet(size_t payload_size);
 void obfs_free_blob(obfs_blob_t *blob);
 
+uint64_t obfs_counter_next_value(void);
+void obfs_record_sent_packet(void);
+void obfs_record_sent_packets(size_t count);
+
 int obfs_random_in_range(int min_value, int max_value);
 uint32_t obfs_pick_magic_value(obfs_message_kind_t kind, uint32_t fallback);
 

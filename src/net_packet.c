@@ -1067,11 +1067,14 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 				memcpy(packet + sizeof(net_len) + 1, hpkt->data, hpkt->len);
 			}
 
-			if(sendto(listen_socket[sock].udp.fd, packet, packet_len, 0, &sa->sa, SALEN(sa->sa)) < 0 && !sockwouldblock(sockerrno)) {
-				if(!sockmsgsize(sockerrno)) {
-					logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: failed to send handshake junk datagram to %s (%s): %s", relay->name, relay->hostname, sockstrerror(sockerrno));
-				}
+		ssize_t sent = sendto(listen_socket[sock].udp.fd, packet, packet_len, 0, &sa->sa, SALEN(sa->sa));
+		if(sent < 0) {
+			if(!sockwouldblock(sockerrno) && !sockmsgsize(sockerrno)) {
+				logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: failed to send handshake junk datagram to %s (%s): %s", relay->name, relay->hostname, sockstrerror(sockerrno));
 			}
+		} else {
+			obfs_record_sent_packet();
+		}
 
 			free(packet);
 		}
@@ -1114,11 +1117,14 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 
 			obfs_free_blob(&junk_payload);
 
-			if(sendto(listen_socket[sock].udp.fd, packet, packet_len, 0, &sa->sa, SALEN(sa->sa)) < 0 && !sockwouldblock(sockerrno)) {
-				if(!sockmsgsize(sockerrno)) {
-					logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: failed to send junk datagram to %s (%s): %s", relay->name, relay->hostname, sockstrerror(sockerrno));
-				}
+		ssize_t sent = sendto(listen_socket[sock].udp.fd, packet, packet_len, 0, &sa->sa, SALEN(sa->sa));
+		if(sent < 0) {
+			if(!sockwouldblock(sockerrno) && !sockmsgsize(sockerrno)) {
+				logger(DEBUG_TRAFFIC, LOG_WARNING, "Obfs: failed to send junk datagram to %s (%s): %s", relay->name, relay->hostname, sockstrerror(sockerrno));
 			}
+		} else {
+			obfs_record_sent_packet();
+		}
 
 			free(packet);
 		}
@@ -1189,7 +1195,8 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 
 	size_t udp_len = buf_ptr - buf;
 
-	if(sendto(listen_socket[sock].udp.fd, buf, udp_len, 0, &sa->sa, SALEN(sa->sa)) < 0 && !sockwouldblock(sockerrno)) {
+	ssize_t sent = sendto(listen_socket[sock].udp.fd, buf, udp_len, 0, &sa->sa, SALEN(sa->sa));
+	if(sent < 0) {
 		if(sockmsgsize(sockerrno)) {
 			// Compensate for SPTPS overhead
 			len -= SPTPS_DATAGRAM_OVERHEAD;
@@ -1209,6 +1216,8 @@ bool send_sptps_data(node_t *to, node_t *from, int type, const void *data, size_
 			obfs_free_blob(&header_junk);
 			return false;
 		}
+	} else if(use_obfs) {
+		obfs_record_sent_packet();
 	}
 
 	FREE_HANDSHAKE_PACKETS();
