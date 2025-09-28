@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+static const char obfs_alnum_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+static uint64_t obfs_packet_counter;
+
 static uint32_t obfs_random_u32(void) {
 	uint32_t value;
 	randomize(&value, sizeof(value));
@@ -39,9 +42,6 @@ void obfs_record_sent_packets(size_t count) {
 }
 
 static obfs_blob_t obfs_new_blob(size_t size);
-
-static const char obfs_alnum_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-static uint64_t obfs_packet_counter;
 
 static uint64_t obfs_hton64(uint64_t value) {
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -343,8 +343,6 @@ static bool obfs_compile_handshake_pattern(obfs_tag_def_t *def, const char *patt
 		while(*param && !isspace((unsigned char)*param)) {
 			++param;
 		}
-
-		char saved = *param;
 
 		if(*param) {
 			*param++ = '\0';
